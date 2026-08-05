@@ -82,9 +82,8 @@ export function nyseOpenMs(date: Date): number {
 export function findMarketOpenIndex(bars: { t: number }[], tfMs: number, date: Date): number {
   const openMs = nyseOpenMs(date);
   // Binance bars start at interval boundaries; the bar containing openMs is
-  // the one with t <= openMs < t+tfMs.
-  const barStart = openMs - ((openMs - 5 * 60 * 1000) % tfMs); // align to tf boundary
-  const target = barStart;
+  // the one starting at floor(openMs / tfMs) * tfMs (UTC-aligned).
+  const target = openMs - (openMs % tfMs);
   // Binary search.
   let lo = 0;
   let hi = bars.length - 1;
@@ -121,14 +120,21 @@ export function resolveStartIndex(
   if (mode === 'custom') {
     startIndex = Math.max(0, Math.min(customIndex ?? 0, lastUsable));
   } else if (mode === 'market-open') {
-    const day = randomTradingDay(rng, today);
-    const idx = findMarketOpenIndex(bars, tfMs, day);
-    if (idx < 0 || idx > lastUsable) {
-      // Fallback to a random index in range.
-      startIndex = randomInt(rng, 0, Math.max(1, lastUsable + 1));
-    } else {
-      startIndex = idx;
+    // The drawn day may be out of the dataset's coverage (e.g. a future date,
+    // or before the symbol was listed). Re-draw until a day whose market-open
+    // bar is within the usable range; bounded attempts keep this deterministic
+    // and fast for any data window.
+    let idx = -1;
+    for (let attempt = 0; attempt < 24; attempt += 1) {
+      const day = randomTradingDay(rng, today);
+      const candidate = findMarketOpenIndex(bars, tfMs, day);
+      if (candidate >= 0 && candidate <= lastUsable) {
+        idx = candidate;
+        break;
+      }
     }
+    // Last resort (e.g. dataset shorter than the usable window): random start.
+    startIndex = idx >= 0 ? idx : randomInt(rng, 0, Math.max(1, lastUsable + 1));
   } else {
     startIndex = randomInt(rng, 0, Math.max(1, lastUsable + 1));
   }

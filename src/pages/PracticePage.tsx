@@ -6,12 +6,14 @@ import {
   advance,
   cancelOrder,
   finalizeStats,
+  orderNotionalAndMargin,
   placeOrder,
   resetToStart,
   availableBalance,
   equity,
   unrealizedPnl,
 } from '../core/engine';
+import { liqPrice, feeRate } from '../core/calc';
 import { KChart, DEFAULT_INDICATORS, type IndicatorConfig } from '../components/KChart';
 import { fmtPrice, fmtQty, fmtSigned, fmtUsd, fmtTime } from '../lib/format';
 import type { Action, OrderType, PracticeState, QuantityUnit } from '../core/types';
@@ -26,16 +28,23 @@ export function PracticePage() {
   const [orderError, setOrderError] = useState<string | null>(null);
   const [indicators, setIndicators] = useState<IndicatorConfig>(DEFAULT_INDICATORS);
 
+  // panel tabs — Binance-style 开仓/平仓
+  const [panelTab, setPanelTab] = useState<'open' | 'close'>('open');
+
   // order form state — open panel only
   const [orderType, setOrderType] = useState<OrderType>('market');
-  const [qtyUnit, setQtyUnit] = useState<'coin' | 'usdt'>('usdt');
   const [qtyStr, setQtyStr] = useState('100');
   const [priceStr, setPriceStr] = useState('');
   const [leverageStr, setLeverageStr] = useState('10');
+  const [levOpen, setLevOpen] = useState(false);
   const [pctValue, setPctValue] = useState(10);
+  const [quickSel, setQuickSel] = useState('');
+  const [tpSlEnabled, setTpSlEnabled] = useState(false);
+  const [tpPriceStr, setTpPriceStr] = useState('');
+  const [slPriceStr, setSlPriceStr] = useState('');
 
   // close panel state — independent sizing for closing orders
-  const [closeType, setCloseType] = useState<OrderType>('market');
+  const [closeType, setCloseType] = useState<OrderType>('limit');
   const [closePriceStr, setClosePriceStr] = useState('');
   const [closePct, setClosePct] = useState(100);
 
@@ -68,6 +77,17 @@ export function PracticePage() {
     };
   }, [sessionId]);
 
+  // Chart height adapts to the viewport (recreated by KChart on change).
+  const [chartHeight, setChartHeight] = useState(() =>
+    typeof window !== 'undefined' && window.matchMedia('(max-width: 760px)').matches ? 300 : 420
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 760px)');
+    const onChange = () => setChartHeight(mq.matches ? 300 : 420);
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
   const persist = useCallback(
     (s: PracticeState) => {
       void savePractice(s);
@@ -89,6 +109,41 @@ export function PracticePage() {
   const eq = state && markPrice ? equity(state, markPrice) : state?.balance ?? 0;
   const avail = state ? availableBalance(state) : 0;
 
+  // Live estimates for the open panel (reference price → margin/liq/max open).
+  const refPrice = useMemo(() => {
+    if (orderType !== 'market') {
+      const p = parseFloat(priceStr);
+      if (Number.isFinite(p) && p > 0) return p;
+    }
+    return markPrice ?? state?.position?.avgPrice ?? 100;
+  }, [orderType, priceStr, markPrice, state]);
+
+  const qtyNum = parseFloat(qtyStr) || 0;
+  const levNum = parseFloat(leverageStr) || 10;
+
+  const est = useMemo(() => {
+    const zero = { qtyBase: 0, notional: 0, margin: 0, liqLong: NaN, liqShort: NaN, maxNotional: 0 };
+    if (!state || qtyNum <= 0) return zero;
+    const { qtyBase, notional, margin } = orderNotionalAndMargin(
+      'marginUsdt',
+      qtyNum,
+      levNum,
+      state,
+      refPrice,
+      feeRate(orderType)
+    );
+    // Max openable notional accounts for the opening fee (fee-reserved).
+    const maxNotional = (avail / (1 + feeRate(orderType) * levNum)) * levNum;
+    return {
+      qtyBase,
+      notional,
+      margin,
+      liqLong: liqPrice(refPrice, 'long', levNum),
+      liqShort: liqPrice(refPrice, 'short', levNum),
+      maxNotional,
+    };
+  }, [state, qtyNum, levNum, refPrice, avail, orderType]);
+
   const isLast = state ? state.currentIndex >= bars.length - 1 : false;
   const showHidden = state?.hidden && !state.revealed;
 
@@ -98,12 +153,20 @@ export function PracticePage() {
     const nextIdx = state.currentIndex + 1;
     const bar = bars[nextIdx];
     if (!bar) return;
+    const beforeStatus = new Map(state.orders.map((o) => [o.id, o.status]));
     let s = advance(state, bar, nextIdx, nextIdx >= bars.length - 1);
     if (s.completed) {
       s = finalizeStats(s);
     }
     setState(s);
     persist(s);
+    const newlyIgnored = s.orders.filter(
+      (o) => beforeStatus.get(o.id) === 'active' && o.status === 'ignored'
+    );
+    if (newlyIgnored.length > 0) {
+      setNotice('有挂单未成交：可用余额不足（保证金 + 手续费）');
+      setTimeout(() => setNotice(null), 3000);
+    }
   }, [state, bars, isLast, persist]);
 
   const onReset = useCallback(() => {
@@ -114,6 +177,22 @@ export function PracticePage() {
     setNotice('已重置回起点');
     setTimeout(() => setNotice(null), 1500);
   }, [state, persist]);
+
+  /** Percentage buttons/slider: fill the margin box with avail × pct%. */
+  const applyPct = useCallback(
+    (p: number) => {
+      const clamped = Math.max(1, Math.min(100, Math.round(p)));
+      setPctValue(clamped);
+      setQtyStr((avail * (clamped / 100)).toFixed(2));
+    },
+    [avail]
+  );
+
+  /** Close-panel percentage: quick buttons / slider / typed input. */
+  const applyClosePct = useCallback((p: number) => {
+    const clamped = Math.max(1, Math.min(100, Math.round(p)));
+    setClosePct(clamped);
+  }, []);
 
   /** Open a position with the given side (long/short). */
   const openOrder = useCallback(
@@ -138,7 +217,7 @@ export function PracticePage() {
       }
       const leverage = parseFloat(leverageStr) || 10;
       const ref = markPrice ?? (state.position?.avgPrice ?? price ?? 100);
-      const unit: QuantityUnit = qtyUnit === 'coin' ? 'btcQty' : 'notional';
+      const unit: QuantityUnit = 'marginUsdt';
       const action: Action = side === 'long' ? 'openLong' : 'openShort';
       const res = placeOrder(
         state,
@@ -148,7 +227,7 @@ export function PracticePage() {
           qty,
           unit,
           price,
-          triggerRef: side === 'short' ? 'high' : 'low',
+          triggerRef: side === 'long' ? 'high' : 'low', // D09: buy/breakout=high, sell/stop=low
           leverage,
         },
         ref
@@ -162,7 +241,7 @@ export function PracticePage() {
       setNotice(`已挂单：${side === 'long' ? '开多' : '开空'}（${orderType === 'market' ? '市价' : orderType === 'limit' ? '限价' : '止损'}）`);
       setTimeout(() => setNotice(null), 1500);
     },
-    [state, orderType, qtyUnit, qtyStr, priceStr, leverageStr, markPrice, persist]
+    [state, orderType, qtyStr, priceStr, leverageStr, markPrice, persist]
   );
 
   /** Market close the full position (one-click). */
@@ -224,6 +303,45 @@ export function PracticePage() {
     setTimeout(() => setNotice(null), 1500);
   }, [state, closeType, closePriceStr, closePct, persist]);
 
+  /** Attach TP (limit) / SL (stop) reduce-only close orders to the position. */
+  const placeTpSl = useCallback(
+    (kind: 'tp' | 'sl') => {
+      setOrderError(null);
+      if (!state || !state.position) return;
+      const raw = kind === 'tp' ? tpPriceStr : slPriceStr;
+      const price = parseFloat(raw);
+      if (!Number.isFinite(price) || price <= 0) {
+        setOrderError(kind === 'tp' ? '请输入有效止盈价' : '请输入有效止损价');
+        return;
+      }
+      const pos = state.position;
+      const action: Action = pos.side === 'long' ? 'closeLong' : 'closeShort';
+      const orderType: OrderType = kind === 'tp' ? 'limit' : 'stop';
+      const res = placeOrder(
+        state,
+        {
+          action,
+          orderType,
+          qty: pos.qty,
+          unit: 'btcQty',
+          price,
+          triggerRef: pos.side === 'long' ? 'low' : 'high',
+          leverage: pos.leverage,
+        },
+        pos.avgPrice
+      );
+      if (res.error) {
+        setOrderError(res.error);
+        return;
+      }
+      setState(res.state);
+      persist(res.state);
+      setNotice(`${kind === 'tp' ? '止盈' : '止损'}单已挂出（${fmtPrice(price)}）`);
+      setTimeout(() => setNotice(null), 1500);
+    },
+    [state, tpPriceStr, slPriceStr, persist]
+  );
+
   const onCancelOrder = useCallback(
     (orderId: string) => {
       if (!state) return;
@@ -252,7 +370,7 @@ export function PracticePage() {
   return (
     <div className="page" style={{ maxWidth: 1400 }}>
       {/* header */}
-      <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+      <div className="practice-head">
         <div className="row" style={{ gap: 10, flexWrap: 'wrap' }}>
           <h1 style={{ margin: 0, fontSize: 18 }}>
             <span className={showHidden ? 'masked' : ''}>
@@ -277,9 +395,9 @@ export function PracticePage() {
 
       {notice && <p className="up" style={{ margin: '6px 0' }}>{notice}</p>}
 
-      <div className="row" style={{ gap: 14, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+      <div className="practice-grid">
         {/* chart */}
-        <div className="card" style={{ flex: '1 1 620px', minWidth: 320 }}>
+        <div className="card chart-card">
           <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
             <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
               <label className="row" style={{ gap: 5, fontSize: 12, color: 'var(--muted)' }}>
@@ -320,7 +438,7 @@ export function PracticePage() {
               )}
             </div>
           </div>
-          <KChart bars={displayBars} height={420} indicators={indicators} />
+          <KChart bars={displayBars} height={chartHeight} indicators={indicators} />
           <div className="row" style={{ justifyContent: 'space-between', marginTop: 8, flexWrap: 'wrap', gap: 8 }}>
             <div className="row" style={{ gap: 14 }}>
               <span>余额 <b className="mono">{fmtUsd(state.balance)}</b></span>
@@ -334,104 +452,306 @@ export function PracticePage() {
           </div>
         </div>
 
-        {/* order panel — open positions only (Binance style) */}
-        <div className="card" style={{ flex: '0 1 340px', minWidth: 300 }}>
-          <h2>开仓</h2>
-
-          {/* order type tabs */}
-          <div className="tabs">
-            {(['limit', 'market', 'stop'] as OrderType[]).map((t) => (
-              <button
-                key={t}
-                className={`tab ${orderType === t ? 'active' : ''}`}
-                onClick={() => setOrderType(t)}
-              >
-                {t === 'limit' ? '限价' : t === 'market' ? '市价' : '止损'}
-              </button>
-            ))}
+          <div className="practice-bottom">
+            {/* order panel — Binance-style 开仓 / 平仓 */}
+            <div className="card order-card">
+          {/* panel header: mode + leverage */}
+          <div className="order-head">
+            <button className="lev-btn" onClick={() => setLevOpen((v) => !v)}>
+              {levNum}× <span className="muted">▾</span>
+            </button>
+            {levOpen && (
+              <input
+                type="number"
+                min={1}
+                className="lev-input"
+                value={leverageStr}
+                onChange={(e) => setLeverageStr(e.target.value)}
+                onBlur={() => setLevOpen(false)}
+              />
+            )}
           </div>
 
-          {orderType !== 'market' && (
-            <div className="inline-label">
-              <span>价格</span>
-              <input type="number" step="any" className="grow" value={priceStr} onChange={(e) => setPriceStr(e.target.value)} placeholder="输入价格" />
-            </div>
+          {/* 开仓 / 平仓 tabs */}
+          <div className="tabs panel-tabs">
+            <button className={`tab ${panelTab === 'open' ? 'active' : ''}`} onClick={() => setPanelTab('open')}>
+              开仓
+            </button>
+            <button className={`tab ${panelTab === 'close' ? 'active' : ''}`} onClick={() => setPanelTab('close')}>
+              平仓
+            </button>
+          </div>
+
+          {panelTab === 'open' ? (
+            <>
+              {/* order type */}
+              <div className="tabs order-type-tabs">
+                {(['limit', 'market', 'stop'] as OrderType[]).map((t) => (
+                  <button
+                    key={t}
+                    className={`tab ${orderType === t ? 'active' : ''}`}
+                    onClick={() => setOrderType(t)}
+                  >
+                    {t === 'limit' ? '限价' : t === 'market' ? '市价' : '条件委托'}
+                  </button>
+                ))}
+              </div>
+
+              {/* available balance */}
+              <div className="row" style={{ justifyContent: 'space-between', margin: '2px 0 10px' }}>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  可用 <b className="mono" style={{ color: 'var(--text)' }}>{fmtUsd(avail)}</b> USDT
+                </span>
+              </div>
+
+              {/* price */}
+              {orderType !== 'market' && (
+                <div className="inline-label">
+                  <span>委托价格</span>
+                  <div className="qty-input-wrap grow">
+                    <input type="number" step="any" value={priceStr} onChange={(e) => setPriceStr(e.target.value)} placeholder="输入价格" />
+                    <span className="unit-tag">USDT</span>
+                    <select
+                      value={quickSel}
+                      onChange={(e) => {
+                        const k = e.target.value as '' | 'o' | 'h' | 'l' | 'c';
+                        if (k && currentBar) setPriceStr(String(currentBar[k]));
+                        setQuickSel('');
+                      }}
+                      style={{ width: 72, flexShrink: 0 }}
+                    >
+                      <option value="">快捷</option>
+                      <option value="o">开</option>
+                      <option value="h">高</option>
+                      <option value="l">低</option>
+                      <option value="c">收</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              {/* quantity / initial margin + unit */}
+              <div className="inline-label">
+                <span>投入金额</span>
+                <div className="qty-input-wrap grow">
+                  <input type="number" step="any" value={qtyStr} onChange={(e) => setQtyStr(e.target.value)} />
+                  <span className="unit-tag">USDT</span>
+                </div>
+              </div>
+
+              {/* pct quick buttons + slider */}
+              <div className="pct-bar" style={{ marginTop: 6 }}>
+                {[25, 50, 75, 100].map((p) => (
+                  <button
+                    key={p}
+                    className={`pct-quick ${Math.round(pctValue) === p ? 'on' : ''}`}
+                    onClick={() => applyPct(p)}
+                  >
+                    {p}%
+                  </button>
+                ))}
+              </div>
+              <div className="pct-bar" style={{ marginTop: 6 }}>
+                <input
+                  type="range"
+                  min={1}
+                  max={100}
+                  value={pctValue}
+                  onChange={(e) => applyPct(parseInt(e.target.value, 10))}
+                  style={{ flex: 1 }}
+                />
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  className="pct-input mono"
+                  value={pctValue}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    if (Number.isFinite(v)) {
+                      const clamped = Math.max(1, Math.min(100, v));
+                      setPctValue(clamped);
+                      setQtyStr((avail * (clamped / 100)).toFixed(2));
+                    }
+                  }}
+                />
+                <span className="muted">%</span>
+              </div>
+              <p className="muted" style={{ fontSize: 11, margin: '4px 0 0' }}>
+                投入金额包含手续费，实际保证金 = 投入金额 − 手续费；百分比按可用余额计算，100% 即投入全部可用。
+              </p>
+
+              {/* buy / sell notional reference */}
+              <div className="row" style={{ justifyContent: 'space-between', marginTop: 8 }}>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  买入 <b className="mono" style={{ color: 'var(--green)' }}>{fmtUsd(est.notional)}</b> USDT
+                </span>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  卖出 <b className="mono" style={{ color: 'var(--red)' }}>{fmtUsd(est.notional)}</b> USDT
+                </span>
+              </div>
+
+              {/* TP / SL */}
+              <label className="row" style={{ gap: 6, fontSize: 12, color: 'var(--muted)', marginTop: 10 }}>
+                <input type="checkbox" checked={tpSlEnabled} onChange={(e) => setTpSlEnabled(e.target.checked)} />
+                止盈/止损
+              </label>
+              {tpSlEnabled && (
+                <div className="tp-panel">
+                  {state.position ? (
+                    <>
+                      <div className="inline-label">
+                        <span>止盈价</span>
+                        <input type="number" step="any" className="grow" value={tpPriceStr} onChange={(e) => setTpPriceStr(e.target.value)} placeholder="输入价格" />
+                      </div>
+                      <div className="row" style={{ justifyContent: 'flex-end', marginBottom: 6 }}>
+                        <button className="btn ghost" style={{ padding: '4px 10px' }} onClick={() => placeTpSl('tp')}>
+                          挂止盈单
+                        </button>
+                      </div>
+                      <div className="inline-label">
+                        <span>止损价</span>
+                        <input type="number" step="any" className="grow" value={slPriceStr} onChange={(e) => setSlPriceStr(e.target.value)} placeholder="输入价格" />
+                      </div>
+                      <div className="row" style={{ justifyContent: 'flex-end' }}>
+                        <button className="btn ghost" style={{ padding: '4px 10px' }} onClick={() => placeTpSl('sl')}>
+                          挂止损单
+                        </button>
+                      </div>
+                      <p className="muted" style={{ fontSize: 11, margin: '6px 0 0' }}>
+                        止盈按限价、止损按条件单挂出，按当前持仓 100% 数量。
+                      </p>
+                    </>
+                  ) : (
+                    <p className="muted" style={{ fontSize: 11, margin: 0 }}>
+                      开仓后可在本面板挂止盈/止损。
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* two-column open buttons with live estimates */}
+              <div className="open-cols">
+                <div>
+                  <button className="big-order long" onClick={() => openOrder('long')} disabled={!state}>
+                    开多
+                  </button>
+                  <div className="est-row">
+                    <span>强平价格</span>
+                    <b>{Number.isFinite(est.liqLong) ? fmtPrice(est.liqLong) : '--'} USDT</b>
+                  </div>
+                  <div className="est-row">
+                    <span>保证金</span>
+                    <b>{fmtUsd(est.margin)} USDT</b>
+                  </div>
+                  <div className="est-row">
+                    <span>可开</span>
+                    <b>{fmtUsd(est.maxNotional)} USDT</b>
+                  </div>
+                </div>
+                <div>
+                  <button className="big-order short" onClick={() => openOrder('short')} disabled={!state}>
+                    开空
+                  </button>
+                  <div className="est-row">
+                    <span>强平价格</span>
+                    <b>{Number.isFinite(est.liqShort) ? fmtPrice(est.liqShort) : '--'} USDT</b>
+                  </div>
+                  <div className="est-row">
+                    <span>保证金</span>
+                    <b>{fmtUsd(est.margin)} USDT</b>
+                  </div>
+                  <div className="est-row">
+                    <span>可开</span>
+                    <b>{fmtUsd(est.maxNotional)} USDT</b>
+                  </div>
+                </div>
+              </div>
+
+              {orderError && <p className="down" style={{ marginTop: 8 }}>{orderError}</p>}
+              <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+                市价单按下一根 K 开盘价成交；限价/条件单挂单持续检测，直到触发或手动取消。
+              </p>
+            </>
+          ) : (
+            <>
+              {state.position ? (
+                <>
+                  <div className="row" style={{ justifyContent: 'space-between', margin: '4px 0 8px' }}>
+                    <span className="muted" style={{ fontSize: 12 }}>平仓挂单</span>
+                    <button className="close-full" style={{ marginTop: 0, width: 'auto', padding: '5px 12px' }} onClick={closeMarket}>
+                      市价全平
+                    </button>
+                  </div>
+
+                  <div className="tabs" style={{ marginBottom: 8 }}>
+                    {(['limit', 'stop'] as OrderType[]).map((t) => (
+                      <button
+                        key={t}
+                        className={`tab ${closeType === t ? 'active' : ''}`}
+                        onClick={() => setCloseType(t)}
+                        style={{ padding: '5px 10px', fontSize: 12 }}
+                      >
+                        {t === 'limit' ? '限价平仓' : '止损平仓'}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="inline-label" style={{ margin: '4px 0' }}>
+                    <span>触发价</span>
+                    <input type="number" step="any" className="grow" value={closePriceStr} onChange={(e) => setClosePriceStr(e.target.value)} placeholder="输入价格" />
+                  </div>
+
+                  <div className="pct-bar" style={{ margin: '4px 0' }}>
+                    {[25, 50, 75, 100].map((p) => (
+                      <button
+                        key={p}
+                        className={`pct-quick ${Math.round(closePct) === p ? 'on' : ''}`}
+                        onClick={() => applyClosePct(p)}
+                      >
+                        {p}%
+                      </button>
+                    ))}
+                    <input
+                      type="range"
+                      min={1}
+                      max={100}
+                      value={closePct}
+                      onChange={(e) => applyClosePct(parseInt(e.target.value, 10))}
+                      style={{ flex: 1 }}
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      className="pct-input mono"
+                      value={closePct}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10);
+                        if (Number.isFinite(v)) {
+                          setClosePct(Math.max(1, Math.min(100, v)));
+                        }
+                      }}
+                    />
+                    <span className="muted">%</span>
+                  </div>
+
+                  <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={closeLimitStop}>
+                    挂{closeType === 'limit' ? '限价' : '止损'}平仓单（{closePct}%）
+                  </button>
+                  <p className="muted" style={{ fontSize: 11, margin: '4px 0 0' }}>
+                    按持仓 {closePct}% 挂单；触发后剩余仓位继续持有。
+                  </p>
+                </>
+              ) : (
+                <div className="empty" style={{ padding: '24px 0' }}>当前无持仓</div>
+              )}
+            </>
           )}
-
-          {/* quantity + unit */}
-          <div className="inline-label">
-            <span>数量</span>
-            <div className="qty-input-wrap grow">
-              <input type="number" step="any" value={qtyStr} onChange={(e) => setQtyStr(e.target.value)} />
-              <select
-                value={qtyUnit}
-                onChange={(e) => setQtyUnit(e.target.value as 'coin' | 'usdt')}
-                style={{ width: 76, flexShrink: 0 }}
-              >
-                <option value="coin">币</option>
-                <option value="usdt">USDT</option>
-              </select>
             </div>
-          </div>
 
-          {/* pct quick buttons + slider — always visible, updates qty box */}
-          <div className="pct-bar" style={{ marginTop: 6 }}>
-            {[25, 50, 75, 100].map((p) => (
-              <button
-                key={p}
-                className={`pct-quick ${Math.round(pctValue) === p ? 'on' : ''}`}
-                onClick={() => {
-                  setPctValue(p);
-                  setQtyStr((avail * (p / 100)).toFixed(2));
-                }}
-              >
-                {p}%
-              </button>
-            ))}
-          </div>
-          <div className="pct-bar" style={{ marginTop: 6 }}>
-            <input
-              type="range"
-              min={1}
-              max={100}
-              value={pctValue}
-              onChange={(e) => {
-                const v = parseInt(e.target.value, 10);
-                setPctValue(v);
-                setQtyStr((avail * (v / 100)).toFixed(2));
-              }}
-              style={{ flex: 1 }}
-            />
-            <span className="mono" style={{ width: 42, textAlign: 'right', flexShrink: 0 }}>
-              {pctValue}%
-            </span>
-          </div>
-          <p className="muted" style={{ fontSize: 11, margin: '4px 0 0' }}>
-            百分比按可用余额的 {pctValue}% 换算成保证金填入数量格。
-          </p>
-
-          {/* leverage */}
-          <div className="inline-label" style={{ marginTop: 10 }}>
-            <span>杠杆</span>
-            <input type="number" min={1} className="grow" value={leverageStr} onChange={(e) => setLeverageStr(e.target.value)} />
-          </div>
-
-          {/* big open buttons */}
-          <button className="big-order long" onClick={() => openOrder('long')} disabled={!state}>
-            开多 · 做多
-          </button>
-          <button className="big-order short" onClick={() => openOrder('short')} disabled={!state}>
-            开空 · 做空
-          </button>
-
-          {orderError && <p className="down" style={{ marginTop: 8 }}>{orderError}</p>}
-          <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
-            市价单按下一根 K 开盘价成交；限价/止损单挂单持续检测，直到触发或手动取消。
-          </p>
-        </div>
-
-        {/* position + orders */}
-        <div className="card" style={{ flex: '1 1 380px', minWidth: 300 }}>
+            {/* position + orders */}
+            <div className="card position-card">
           <h2>持仓</h2>
           {state.position ? (
             <table>
@@ -447,63 +767,6 @@ export function PracticePage() {
             </table>
           ) : (
             <div className="empty">无持仓</div>
-          )}
-
-          {/* independent close panel — only when a position exists */}
-          {state.position && (
-            <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
-              <div className="row" style={{ justifyContent: 'space-between', marginBottom: 8 }}>
-                <span className="muted" style={{ fontSize: 12 }}>平仓</span>
-                <button className="close-full" style={{ marginTop: 0, width: 'auto', padding: '5px 12px' }} onClick={closeMarket}>
-                  市价全平
-                </button>
-              </div>
-
-              <div className="tabs" style={{ marginBottom: 8 }}>
-                {(['limit', 'stop'] as OrderType[]).map((t) => (
-                  <button
-                    key={t}
-                    className={`tab ${closeType === t ? 'active' : ''}`}
-                    onClick={() => setCloseType(t)}
-                    style={{ padding: '5px 10px', fontSize: 12 }}
-                  >
-                    {t === 'limit' ? '限价平仓' : '止损平仓'}
-                  </button>
-                ))}
-              </div>
-
-              <div className="inline-label" style={{ margin: '4px 0' }}>
-                <span>触发价</span>
-                <input type="number" step="any" className="grow" value={closePriceStr} onChange={(e) => setClosePriceStr(e.target.value)} placeholder="输入价格" />
-              </div>
-
-              <div className="pct-bar" style={{ margin: '4px 0' }}>
-                {[25, 50, 75, 100].map((p) => (
-                  <button
-                    key={p}
-                    className={`pct-quick ${Math.round(closePct) === p ? 'on' : ''}`}
-                    onClick={() => setClosePct(p)}
-                  >
-                    {p}%
-                  </button>
-                ))}
-                <input
-                  type="range"
-                  min={1}
-                  max={100}
-                  value={closePct}
-                  onChange={(e) => setClosePct(parseInt(e.target.value, 10))}
-                  style={{ flex: 1 }}
-                />
-              </div>
-
-              <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={closeLimitStop}>
-                挂{closeType === 'limit' ? '限价' : '止损'}平仓单（{closePct}%）
-              </button>
-              <p className="muted" style={{ fontSize: 11, margin: '4px 0 0' }}>
-                按持仓 {closePct}% 挂单；触发后剩余仓位继续持有。
-              </p>
-            </div>
           )}
 
           <h2 style={{ marginTop: 16 }}>挂单 ({activeOrders.length})</h2>
@@ -554,9 +817,10 @@ export function PracticePage() {
               </tbody>
             </table>
           )}
+            </div>
+          </div>
         </div>
       </div>
-    </div>
   );
 }
 

@@ -197,6 +197,87 @@ describe('event order priority (D05)', () => {
   });
 });
 
+describe('open stop (conditional) orders trigger without a position', () => {
+  it('buy stop opens a long when high crosses the trigger', () => {
+    let s = createPractice(settings(), 1);
+    const res = placeOrder(
+      s,
+      { action: 'openLong', orderType: 'stop', qty: 1, unit: 'btcQty', leverage: 10, price: 105, triggerRef: 'high' } as OrderInput,
+      100
+    );
+    s = res.state;
+    // Bar high 108 >= 105 triggers; open 106 >= 105 → fills at open (D10).
+    s = advance(s, { t: 1_600_000_005_000, o: 106, h: 108, l: 104, c: 107, v: 1 }, 1, false);
+    expect(s.position).not.toBeNull();
+    expect(s.position!.side).toBe('long');
+    expect(s.position!.avgPrice).toBe(106);
+    expect(s.orders[0].status).toBe('filled');
+  });
+
+  it('buy stop fills at the trigger price when the bar opens below it', () => {
+    let s = createPractice(settings(), 1);
+    const res = placeOrder(
+      s,
+      { action: 'openLong', orderType: 'stop', qty: 1, unit: 'btcQty', leverage: 10, price: 105, triggerRef: 'high' } as OrderInput,
+      100
+    );
+    s = res.state;
+    // Open 103 < 105, high 106 >= 105 → fill at trigger 105 (D10).
+    s = advance(s, { t: 1_600_000_005_000, o: 103, h: 106, l: 102, c: 105, v: 1 }, 1, false);
+    expect(s.position).not.toBeNull();
+    expect(s.position!.avgPrice).toBe(105);
+  });
+
+  it('sell stop opens a short when low crosses the trigger', () => {
+    let s = createPractice(settings(), 1);
+    const res = placeOrder(
+      s,
+      { action: 'openShort', orderType: 'stop', qty: 1, unit: 'btcQty', leverage: 10, price: 95, triggerRef: 'low' } as OrderInput,
+      100
+    );
+    s = res.state;
+    // Open 94 <= 95 → gap fill at open (D10).
+    s = advance(s, { t: 1_600_000_005_000, o: 94, h: 97, l: 92, c: 95, v: 1 }, 1, false);
+    expect(s.position).not.toBeNull();
+    expect(s.position!.side).toBe('short');
+    expect(s.position!.avgPrice).toBe(94);
+  });
+
+  it('stays active when the bar never crosses the trigger price', () => {
+    let s = createPractice(settings(), 1);
+    const res = placeOrder(
+      s,
+      { action: 'openLong', orderType: 'stop', qty: 1, unit: 'btcQty', leverage: 10, price: 105, triggerRef: 'high' } as OrderInput,
+      100
+    );
+    s = res.state;
+    s = advance(s, { t: 1_600_000_005_000, o: 102, h: 104, l: 101, c: 103, v: 1 }, 1, false);
+    expect(s.position).toBeNull();
+    expect(s.orders[0].status).toBe('active');
+  });
+
+  it('only the earliest-created open stop fires when several trigger in one bar', () => {
+    let s = createPractice(settings(), 1);
+    const a = placeOrder(
+      s,
+      { action: 'openLong', orderType: 'stop', qty: 1, unit: 'btcQty', leverage: 10, price: 105, triggerRef: 'high' } as OrderInput,
+      100
+    );
+    s = a.state;
+    const b = placeOrder(
+      s,
+      { action: 'openLong', orderType: 'stop', qty: 1, unit: 'btcQty', leverage: 10, price: 106, triggerRef: 'high' } as OrderInput,
+      100
+    );
+    s = b.state;
+    // Bar: open 107 >= both triggers → earliest (105) wins, the other cancels.
+    s = advance(s, { t: 1_600_000_005_000, o: 107, h: 110, l: 106, c: 109, v: 1 }, 1, false);
+    expect(s.orders.find((o) => o.id === a.order!.id)!.status).toBe('filled');
+    expect(s.orders.find((o) => o.id === b.order!.id)!.status).toBe('cancelled');
+    expect(s.position!.qty).toBe(1);
+  });
+});
+
 describe('limit orders (D07/D08)', () => {
   it('gap through limit fills at open', () => {
     let s = createPractice(settings(), 1);
@@ -345,6 +426,26 @@ describe('fees', () => {
     s = advance(s, { t: 1_600_000_005_000, o: 100, h: 100, l: 100, c: 100, v: 1 }, 1, false);
     expect(s.position).toBeNull();
     expect(s.orders[0].status).toBe('ignored');
+  });
+
+  it('marginUsdt amount is fee-inclusive: fee comes out of the invested amount', () => {
+    // Invest 200 USDT at 10x, taker fee 0.05%:
+    // actual margin = 200/(1+10×0.0005) ≈ 199.005; fee ≈ 0.995, so
+    // margin + fee = invested amount exactly.
+    let s = createPractice(settings({ initialCapital: 1000 }), 1);
+    const res = placeOrder(
+      s,
+      { action: 'openLong', orderType: 'market', qty: 200, unit: 'marginUsdt', leverage: 10 } as OrderInput,
+      100
+    );
+    s = res.state;
+    const expectedMargin = 200 / (1 + 10 * 0.0005);
+    // qtyBase × refPrice = notional = margin × leverage
+    expect(s.orders[0].qty * 100).toBeCloseTo(expectedMargin * 10, 4);
+    s = advance(s, { t: 1_600_000_005_000, o: 100, h: 100, l: 100, c: 100, v: 1 }, 1, false);
+    expect(s.position).not.toBeNull();
+    expect(s.position!.margin).toBeCloseTo(expectedMargin, 4);
+    expect(s.position!.margin + (s.orders[0].fee ?? 0)).toBeCloseTo(200, 4);
   });
 
   it('charges taker fee on market orders', () => {

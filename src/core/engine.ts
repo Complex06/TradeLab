@@ -77,7 +77,8 @@ export function resolveBaseQty(
   qty: number,
   leverage: number,
   state: PracticeState,
-  refPrice: number
+  refPrice: number,
+  feeRateNum: number
 ): number {
   const avail = availableBalance(state);
   switch (unit) {
@@ -86,7 +87,9 @@ export function resolveBaseQty(
     case 'notional':
       return qty / refPrice;
     case 'marginUsdt':
-      return (qty * leverage) / refPrice;
+      // Fee-inclusive invested amount: margin = qty/(1+leverage×fee), so the
+      // opening fee is paid out of the invested amount, not reserved extra.
+      return (qty * leverage) / ((1 + leverage * feeRateNum) * refPrice);
     case 'marginPct':
       return (avail * (qty / 100) * leverage) / refPrice;
   }
@@ -98,9 +101,10 @@ export function orderNotionalAndMargin(
   qty: number,
   leverage: number,
   state: PracticeState,
-  refPrice: number
+  refPrice: number,
+  feeRateNum: number
 ): { qtyBase: number; notional: number; margin: number } {
-  const qtyBase = resolveBaseQty(unit, qty, leverage, state, refPrice);
+  const qtyBase = resolveBaseQty(unit, qty, leverage, state, refPrice, feeRateNum);
   const notional = qtyBase * refPrice;
   const margin = requiredMargin(notional, leverage);
   return { qtyBase, notional, margin };
@@ -145,7 +149,14 @@ export function placeOrder(state: PracticeState, input: OrderInput, refPrice: nu
     if (!match) return { state, error: '平仓方向与持仓不匹配' };
   }
 
-  const { qtyBase } = orderNotionalAndMargin(input.unit, input.qty, input.leverage, state, refPrice);
+  const { qtyBase } = orderNotionalAndMargin(
+    input.unit,
+    input.qty,
+    input.leverage,
+    state,
+    refPrice,
+    feeRate(input.orderType)
+  );
   if (!Number.isFinite(qtyBase) || qtyBase <= 0) {
     return { state, error: '无法计算下单数量（请检查保证金/余额）' };
   }
@@ -310,8 +321,10 @@ function liquidate(state: PracticeState, pos: Position, index: number, ts: numbe
 }
 
 /** Priority of an event (stop) order per D05: liq > stop-loss > take-profit > open. */
-function stopPriority(o: Order, pos: Position): number {
+function stopPriority(o: Order, pos: Position | null): number {
   if (o.action === 'closeLong' || o.action === 'closeShort') {
+    // A close order is not a real event without a position (D16: ignored).
+    if (!pos) return 0;
     // stop-loss: for long, price <= avg; for short, price >= avg (worst case first)
     const isSL = o.action === 'closeLong' ? o.price! <= pos.avgPrice : o.price! >= pos.avgPrice;
     return isSL ? 3 : 2;
@@ -335,46 +348,52 @@ export function advance(state: PracticeState, bar: Bar, index: number, isLastBar
 
   // --- Stage 2: event (stop) orders — at most ONE fires ---
   const pos = s.position;
+  let liqHit = false;
   if (pos) {
-    const liqHit = pos.side === 'long' ? bar.l <= pos.liqPrice : bar.h >= pos.liqPrice;
+    liqHit = pos.side === 'long' ? bar.l <= pos.liqPrice : bar.h >= pos.liqPrice;
     if (liqHit) {
       liquidate(s, pos, index, bar.t);
       // Liquidation cancels ALL event orders (D06).
       for (const o of s.orders) if (o.status === 'active' && o.orderType === 'stop') o.status = 'cancelled';
-    } else {
-      let best: Order | null = null;
-      let bestPrio = -1;
-      for (const o of s.orders) {
-        if (o.status !== 'active' || o.orderType !== 'stop') continue;
-        const sellSide = o.action === 'openShort' || o.action === 'closeLong';
-        const triggered = sellSide ? bar.l <= o.price! : bar.h >= o.price!;
-        if (!triggered) continue;
-        const prio = stopPriority(o, s.position!);
-        let isBetter: boolean;
-        if (best === null) {
-          isBetter = true;
-        } else if (prio !== bestPrio) {
-          isBetter = prio > bestPrio;
-        } else {
-          // Same priority layer → earliest created wins (deterministic tie-break).
-          isBetter = o.createdAtIndex < best.createdAtIndex ||
-            (o.createdAtIndex === best.createdAtIndex && o.id < best.id);
-        }
-        if (isBetter) {
-          best = o;
-          bestPrio = prio;
-        }
+    }
+  }
+  // Event scan runs with or without a position: open stop orders must be able
+  // to trigger (buy stop needs high ≥ price; sell stop needs low ≤ price).
+  if (!liqHit) {
+    let best: Order | null = null;
+    let bestPrio = -1;
+    for (const o of s.orders) {
+      if (o.status !== 'active' || o.orderType !== 'stop') continue;
+      // Reduce-only close orders without a position are ignored, not events.
+      if (o.reduceOnly && !s.position) continue;
+      const sellSide = o.action === 'openShort' || o.action === 'closeLong';
+      const triggered = sellSide ? bar.l <= o.price! : bar.h >= o.price!;
+      if (!triggered) continue;
+      const prio = stopPriority(o, s.position);
+      let isBetter: boolean;
+      if (best === null) {
+        isBetter = true;
+      } else if (prio !== bestPrio) {
+        isBetter = prio > bestPrio;
+      } else {
+        // Same priority layer → earliest created wins (deterministic tie-break).
+        isBetter = o.createdAtIndex < best.createdAtIndex ||
+          (o.createdAtIndex === best.createdAtIndex && o.id < best.id);
       }
-      if (best) {
-        const sellSide = best.action === 'openShort' || best.action === 'closeLong';
-        const gapFill = sellSide ? bar.o <= best.price! : bar.o >= best.price!;
-        const fillPrice = gapFill ? bar.o : best.price!; // D10
-        if (best.reduceOnly) closeFill(s, best, fillPrice, index, bar.t);
-        else openFill(s, best, fillPrice, index, bar.t);
-        // Cancel all other active stop orders (D05).
-        for (const o of s.orders) {
-          if (o.status === 'active' && o.orderType === 'stop' && o.id !== best.id) o.status = 'cancelled';
-        }
+      if (isBetter) {
+        best = o;
+        bestPrio = prio;
+      }
+    }
+    if (best) {
+      const sellSide = best.action === 'openShort' || best.action === 'closeLong';
+      const gapFill = sellSide ? bar.o <= best.price! : bar.o >= best.price!;
+      const fillPrice = gapFill ? bar.o : best.price!; // D10
+      if (best.reduceOnly) closeFill(s, best, fillPrice, index, bar.t);
+      else openFill(s, best, fillPrice, index, bar.t);
+      // Cancel all other active stop orders (D05).
+      for (const o of s.orders) {
+        if (o.status === 'active' && o.orderType === 'stop' && o.id !== best.id) o.status = 'cancelled';
       }
     }
   }
