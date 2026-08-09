@@ -8,14 +8,16 @@ import {
   finalizeStats,
   orderNotionalAndMargin,
   placeOrder,
+  PRACTICE_VERSION,
   resetToStart,
   availableBalance,
   equity,
   unrealizedPnl,
 } from '../core/engine';
 import { liqPrice, feeRate } from '../core/calc';
-import { KChart, DEFAULT_INDICATORS, type IndicatorConfig } from '../components/KChart';
-import { fmtPrice, fmtQty, fmtSigned, fmtUsd, fmtTime } from '../lib/format';
+import { KChart, DEFAULT_INDICATORS, type IndicatorConfig, type TradeMarker } from '../components/KChart';
+import type { UTCTimestamp } from 'lightweight-charts';
+import { fmtPrice, fmtQty, fmtSigned, fmtUsd, fmtTime, fmtDuration } from '../lib/format';
 import type { Action, OrderType, PracticeState, QuantityUnit } from '../core/types';
 
 export function PracticePage() {
@@ -47,6 +49,7 @@ export function PracticePage() {
   const [closeType, setCloseType] = useState<OrderType>('limit');
   const [closePriceStr, setClosePriceStr] = useState('');
   const [closePct, setClosePct] = useState(100);
+  const [closeQuickSel, setCloseQuickSel] = useState('');
 
   const stateRef = useRef<PracticeState | null>(null);
   stateRef.current = state;
@@ -69,7 +72,21 @@ export function PracticePage() {
       if (cancelled) return;
       const agg = aggregate5m(ds.bars, p.tfMs);
       setBars(agg);
-      setState(p);
+
+      // v1 snapshots stored indices in raw 5m space; migrate them once to
+      // aggregated-bar space (v2+). New practices are created aggregated.
+      let loaded = p;
+      if (p.version < PRACTICE_VERSION) {
+        const aggRatio = p.tfMs / (5 * 60 * 1000);
+        loaded = {
+          ...p,
+          version: PRACTICE_VERSION,
+          startIndex: Math.floor(p.startIndex / aggRatio),
+          currentIndex: Math.floor(p.currentIndex / aggRatio),
+        };
+        void savePractice(loaded);
+      }
+      setState(loaded);
       setLeverageStr(String(p.settings.defaultLeverage));
     })();
     return () => {
@@ -143,6 +160,42 @@ export function PracticePage() {
       maxNotional,
     };
   }, [state, qtyNum, levNum, refPrice, avail, orderType]);
+
+  // Close-panel estimates at the reference price (mirrors the open panel).
+  const closeEst = useMemo(() => {
+    const pos = state?.position;
+    if (!pos) return { qty: 0, fee: 0, pnl: 0, remaining: 0 };
+    const qty = pos.qty * (closePct / 100);
+    let ref: number;
+    if (closeType !== 'market') {
+      const p = parseFloat(closePriceStr);
+      ref = Number.isFinite(p) && p > 0 ? p : (markPrice ?? pos.avgPrice);
+    } else {
+      ref = markPrice ?? pos.avgPrice;
+    }
+    const fee = qty * ref * feeRate(closeType);
+    const gross = pos.side === 'long' ? (ref - pos.avgPrice) * qty : (pos.avgPrice - ref) * qty;
+    return { qty, fee, pnl: gross - fee, remaining: Math.max(0, pos.qty - qty) };
+  }, [state, closePct, closeType, closePriceStr, markPrice]);
+
+  // Trade fill markers: B below the bar for buys, S above for sells.
+  const tradeMarkers = useMemo<TradeMarker[]>(() => {
+    if (!state) return [];
+    const out: TradeMarker[] = [];
+    for (const r of state.tradeRecords) {
+      const bar = bars[r.index];
+      if (!bar) continue;
+      const buy = r.action === 'openLong' || r.action === 'closeShort';
+      out.push({
+        time: (bar.t / 1000) as UTCTimestamp,
+        color: buy ? '#22c55e' : '#ef4444',
+        text: buy ? 'B' : 'S',
+        price: buy ? bar.l : bar.h,
+        anchor: buy ? 'below' : 'above',
+      });
+    }
+    return out;
+  }, [state, bars]);
 
   const isLast = state ? state.currentIndex >= bars.length - 1 : false;
   const showHidden = state?.hidden && !state.revealed;
@@ -244,42 +297,25 @@ export function PracticePage() {
     [state, orderType, qtyStr, priceStr, leverageStr, markPrice, persist]
   );
 
-  /** Market close the full position (one-click). */
-  const closeMarket = useCallback(() => {
+  /** Place a close order (market/limit/stop) sized by pct of the position. */
+  const placeCloseOrder = useCallback(() => {
     setOrderError(null);
     if (!state || !state.position) return;
-    const action: Action = state.position.side === 'long' ? 'closeLong' : 'closeShort';
-    const res = placeOrder(
-      state,
-      { action, orderType: 'market', qty: state.position.qty, unit: 'btcQty', leverage: state.position.leverage },
-      state.position.avgPrice
-    );
-    if (res.error) {
-      setOrderError(res.error);
-      return;
-    }
-    setState(res.state);
-    persist(res.state);
-    setNotice('市价平仓挂单已下，下一根成交');
-    setTimeout(() => setNotice(null), 1500);
-  }, [state, persist]);
-
-  /** Place a limit/stop close order sized by pct of the position. */
-  const closeLimitStop = useCallback(() => {
-    setOrderError(null);
-    if (!state || !state.position) return;
-    const price = parseFloat(closePriceStr);
-    if (!Number.isFinite(price) || price <= 0) {
-      setOrderError('请输入平仓触发价格');
-      return;
-    }
-    // qty = pct of current position → base qty directly.
-    const qty = state.position.qty * (closePct / 100);
+    const pos = state.position;
+    const qty = pos.qty * (closePct / 100);
     if (!Number.isFinite(qty) || qty <= 0) {
       setOrderError('平仓数量无效');
       return;
     }
-    const action: Action = state.position.side === 'long' ? 'closeLong' : 'closeShort';
+    let price: number | undefined;
+    if (closeType !== 'market') {
+      price = parseFloat(closePriceStr);
+      if (!Number.isFinite(price) || price <= 0) {
+        setOrderError('请输入有效触发价格');
+        return;
+      }
+    }
+    const action: Action = pos.side === 'long' ? 'closeLong' : 'closeShort';
     const res = placeOrder(
       state,
       {
@@ -288,10 +324,10 @@ export function PracticePage() {
         qty,
         unit: 'btcQty',
         price,
-        triggerRef: state.position.side === 'long' ? 'low' : 'high',
-        leverage: state.position.leverage,
+        triggerRef: pos.side === 'long' ? 'low' : 'high',
+        leverage: pos.leverage,
       },
-      state.position.avgPrice
+      pos.avgPrice
     );
     if (res.error) {
       setOrderError(res.error);
@@ -299,7 +335,8 @@ export function PracticePage() {
     }
     setState(res.state);
     persist(res.state);
-    setNotice(`已挂平仓单（${closeType === 'limit' ? '限价' : '止损'} @ ${fmtPrice(price)}）`);
+    const typeLabel = closeType === 'market' ? '市价' : closeType === 'limit' ? '限价' : '条件';
+    setNotice(`${typeLabel}平仓单已挂出（${closePct}%）`);
     setTimeout(() => setNotice(null), 1500);
   }, [state, closeType, closePriceStr, closePct, persist]);
 
@@ -365,7 +402,6 @@ export function PracticePage() {
   if (!state) return <div className="page"><p className="muted">加载中…</p></div>;
 
   const activeOrders = state.orders.filter((o) => o.status === 'active');
-  const recentRecords = state.tradeRecords.slice(-8).reverse();
 
   return (
     <div className="page" style={{ maxWidth: 1400 }}>
@@ -400,6 +436,10 @@ export function PracticePage() {
         <div className="card chart-card">
           <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
             <div className="row" style={{ gap: 12, flexWrap: 'wrap' }}>
+              <label className="row" style={{ gap: 5, fontSize: 12, color: 'var(--muted)' }}>
+                <input type="checkbox" checked={indicators.volume.enabled} onChange={(e) => setIndicators((i) => ({ ...i, volume: { ...i.volume, enabled: e.target.checked } }))} />
+                成交量
+              </label>
               <label className="row" style={{ gap: 5, fontSize: 12, color: 'var(--muted)' }}>
                 <input type="checkbox" checked={indicators.ema.enabled} onChange={(e) => setIndicators((i) => ({ ...i, ema: { ...i.ema, enabled: e.target.checked } }))} />
                 EMA
@@ -438,7 +478,7 @@ export function PracticePage() {
               )}
             </div>
           </div>
-          <KChart bars={displayBars} height={chartHeight} indicators={indicators} />
+          <KChart bars={displayBars} height={chartHeight} indicators={indicators} markers={tradeMarkers} />
           <div className="row" style={{ justifyContent: 'space-between', marginTop: 8, flexWrap: 'wrap', gap: 8 }}>
             <div className="row" style={{ gap: 14 }}>
               <span>余额 <b className="mono">{fmtUsd(state.balance)}</b></span>
@@ -677,32 +717,47 @@ export function PracticePage() {
             <>
               {state.position ? (
                 <>
-                  <div className="row" style={{ justifyContent: 'space-between', margin: '4px 0 8px' }}>
-                    <span className="muted" style={{ fontSize: 12 }}>平仓挂单</span>
-                    <button className="close-full" style={{ marginTop: 0, width: 'auto', padding: '5px 12px' }} onClick={closeMarket}>
-                      市价全平
-                    </button>
-                  </div>
-
-                  <div className="tabs" style={{ marginBottom: 8 }}>
-                    {(['limit', 'stop'] as OrderType[]).map((t) => (
+                  {/* Close type tabs — same style as the open panel */}
+                  <div className="tabs order-type-tabs">
+                    {(['limit', 'market', 'stop'] as OrderType[]).map((t) => (
                       <button
                         key={t}
                         className={`tab ${closeType === t ? 'active' : ''}`}
                         onClick={() => setCloseType(t)}
-                        style={{ padding: '5px 10px', fontSize: 12 }}
                       >
-                        {t === 'limit' ? '限价平仓' : '止损平仓'}
+                        {t === 'limit' ? '限价' : t === 'market' ? '市价' : '条件委托'}
                       </button>
                     ))}
                   </div>
 
-                  <div className="inline-label" style={{ margin: '4px 0' }}>
-                    <span>触发价</span>
-                    <input type="number" step="any" className="grow" value={closePriceStr} onChange={(e) => setClosePriceStr(e.target.value)} placeholder="输入价格" />
-                  </div>
+                  {/* Trigger price + quick fill (only for limit/stop, same as open) */}
+                  {closeType !== 'market' && (
+                    <div className="inline-label" style={{ marginTop: 10 }}>
+                      <span>触发价格</span>
+                      <div className="qty-input-wrap grow">
+                        <input type="number" step="any" value={closePriceStr} onChange={(e) => setClosePriceStr(e.target.value)} placeholder="输入价格" />
+                        <span className="unit-tag">USDT</span>
+                        <select
+                          value={closeQuickSel}
+                          onChange={(e) => {
+                            const k = e.target.value as '' | 'o' | 'h' | 'l' | 'c';
+                            if (k && currentBar) setClosePriceStr(String(currentBar[k]));
+                            setCloseQuickSel('');
+                          }}
+                          style={{ width: 72, flexShrink: 0 }}
+                        >
+                          <option value="">快捷</option>
+                          <option value="o">开</option>
+                          <option value="h">高</option>
+                          <option value="l">低</option>
+                          <option value="c">收</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
 
-                  <div className="pct-bar" style={{ margin: '4px 0' }}>
+                  {/* Percentage buttons */}
+                  <div className="pct-bar" style={{ marginTop: 8 }}>
                     {[25, 50, 75, 100].map((p) => (
                       <button
                         key={p}
@@ -712,6 +767,8 @@ export function PracticePage() {
                         {p}%
                       </button>
                     ))}
+                  </div>
+                  <div className="pct-bar" style={{ marginTop: 6 }}>
                     <input
                       type="range"
                       min={1}
@@ -736,15 +793,37 @@ export function PracticePage() {
                     <span className="muted">%</span>
                   </div>
 
-                  <button className="btn" style={{ width: '100%', marginTop: 6 }} onClick={closeLimitStop}>
-                    挂{closeType === 'limit' ? '限价' : '止损'}平仓单（{closePct}%）
+                  {/* Close action */}
+                  <button className="big-order short" style={{ marginTop: 12 }} onClick={placeCloseOrder}>
+                    平仓
                   </button>
-                  <p className="muted" style={{ fontSize: 11, margin: '4px 0 0' }}>
-                    按持仓 {closePct}% 挂单；触发后剩余仓位继续持有。
+
+                  {/* Estimates — mirror the open panel */}
+                  <div className="est-row">
+                    <span>平仓数量</span>
+                    <b className="mono">{fmtQty(closeEst.qty)}</b>
+                  </div>
+                  <div className="est-row">
+                    <span>预计盈亏</span>
+                    <b className={`mono ${closeEst.pnl >= 0 ? 'up' : 'down'}`}>{fmtSigned(closeEst.pnl)} USDT</b>
+                  </div>
+                  <div className="est-row">
+                    <span>手续费</span>
+                    <b className="mono">{fmtUsd(closeEst.fee)} USDT</b>
+                  </div>
+                  <div className="est-row">
+                    <span>剩余持仓</span>
+                    <b className="mono">{fmtQty(closeEst.remaining)}</b>
+                  </div>
+
+                  <p className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+                    {closeType === 'market'
+                      ? '市价单按下一根 K 开盘价成交。'
+                      : `按持仓 ${closePct}% 挂单；触发后剩余仓位继续持有。`}
                   </p>
                 </>
               ) : (
-                <div className="empty" style={{ padding: '24px 0' }}>当前无持仓</div>
+                <div className="empty" style={{ padding: '40px 0' }}>当前无持仓</div>
               )}
             </>
           )}
@@ -795,23 +874,41 @@ export function PracticePage() {
             </table>
           )}
 
-          <h2 style={{ marginTop: 16 }}>最近成交</h2>
-          {recentRecords.length === 0 ? (
-            <div className="empty">暂无成交</div>
+          <h2 style={{ marginTop: 16 }}>仓位历史 ({state.closedTrades.length})</h2>
+          {state.closedTrades.length === 0 ? (
+            <div className="empty">暂无历史</div>
           ) : (
             <table>
               <thead>
-                <tr><th>动作</th><th>数量</th><th>价格</th><th>手续费</th></tr>
+                <tr>
+                  <th>方向</th>
+                  <th>数量</th>
+                  <th>开仓价</th>
+                  <th>平仓价</th>
+                  <th>盈亏</th>
+                  <th>手续费</th>
+                  <th>持仓时间</th>
+                </tr>
               </thead>
               <tbody>
-                {recentRecords.map((r) => (
-                  <tr key={r.id}>
+                {state.closedTrades.slice().reverse().map((t, i) => (
+                  <tr key={`${t.openedAt}-${t.closedAt}-${i}`}>
                     <td>
-                      {r.liq ? <span className="badge" style={{ background: 'rgba(239,68,68,.2)', color: '#ef4444' }}>强平</span> : actionLabel(r.action)}
+                      {t.side ? (
+                        <span className={`badge ${t.side}`}>
+                          {t.side === 'long' ? '多' : '空'}
+                          {t.liq ? '·强平' : ''}
+                        </span>
+                      ) : (
+                        '—'
+                      )}
                     </td>
-                    <td className="mono">{fmtQty(r.qty)}</td>
-                    <td className="mono">{fmtPrice(r.price)}</td>
-                    <td className="mono">{fmtUsd(r.fee)}</td>
+                    <td className="mono">{t.qty != null ? fmtQty(t.qty) : '—'}</td>
+                    <td className="mono">{t.openPrice != null ? fmtPrice(t.openPrice) : '—'}</td>
+                    <td className="mono">{t.closePrice != null ? fmtPrice(t.closePrice) : '—'}</td>
+                    <td className={`mono ${t.pnl >= 0 ? 'up' : 'down'}`}>{fmtSigned(t.pnl)}</td>
+                    <td className="mono">{fmtUsd(t.fee ?? 0)}</td>
+                    <td className="mono">{fmtDuration(t.holdIndex * state.tfMs)}</td>
                   </tr>
                 ))}
               </tbody>

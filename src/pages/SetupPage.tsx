@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useDatasets } from '../data/hooks';
 import { getDataset, savePractice } from '../data/db';
-import { TF_OPTIONS } from '../core/aggregate';
+import { TF_OPTIONS, aggregate5m } from '../core/aggregate';
 import { makeRng, resolveStartIndex } from '../core/random';
 import { createPractice } from '../core/engine';
 import type { PracticeSettings } from '../core/types';
@@ -57,31 +57,25 @@ export function SetupPage() {
     setForm((f) => ({ ...f, [k]: v }));
   }
 
-  function pickRandom(): void {
+  async function pickRandom(): Promise<void> {
     setError(null);
-    // UI-randomize uses plain Math.random (not reproducible; that's fine).
-    const tf = TF_OPTIONS[Math.floor(Math.random() * TF_OPTIONS.length)];
-    const sym = symbols.length ? symbols[Math.floor(Math.random() * symbols.length)] : '';
-    setForm((f) => ({
-      ...f,
-      tfMs: tf.ms,
-      symbol: sym,
-      startMode: 'random',
-      hidden: true,
-    }));
-  }
-
-  async function onSubmit(e: React.FormEvent) {
-    e.preventDefault();
+    setInfo(null);
     if (symbols.length === 0) {
       setError('请先导入数据（Library 页导入数据包）');
       return;
     }
+    // UI-randomize uses plain Math.random (not reproducible; that's fine).
+    const tf = TF_OPTIONS[Math.floor(Math.random() * TF_OPTIONS.length)];
+    const sym = symbols[Math.floor(Math.random() * symbols.length)];
+    // Directly start practice with random settings without updating form fields
+    await startPractice(tf.ms, sym, 'random', true);
+  }
+
+  async function startPractice(tfMs: number, symbol: string, startMode: StartMode, hidden: boolean): Promise<void> {
     setBusy(true);
     setError(null);
     setInfo(null);
     try {
-      const symbol = form.symbol;
       const ds = await getDataset(symbol);
       if (!ds) {
         setError(`找不到品种 ${symbol} 的数据`);
@@ -91,14 +85,15 @@ export function SetupPage() {
       const rng = makeRng(seed);
       const historyCount = Math.max(0, parseInt(form.historyCount) || 0);
 
-      // Resolve start index.
-      const bars = ds.bars;
+      // Practice indices live in AGGREGATED-bar space: aggregate first, then
+      // resolve the start index against the exact series the practice shows.
+      const bars = aggregate5m(ds.bars, tfMs);
       const today = new Date();
       const resolution = resolveStartIndex(
         bars,
-        form.tfMs,
-        form.startMode,
-        form.startMode === 'custom' ? parseInt(form.customIndex) || 0 : null,
+        tfMs,
+        startMode,
+        startMode === 'custom' ? parseInt(form.customIndex) || 0 : null,
         rng,
         today,
         historyCount
@@ -106,7 +101,7 @@ export function SetupPage() {
       const startIndex = resolution.startIndex;
 
       const settings: PracticeSettings = {
-        tf: form.tfMs,
+        tf: tfMs,
         symbol,
         startIndex,
         historyCount,
@@ -114,17 +109,28 @@ export function SetupPage() {
         defaultLeverage: parseFloat(form.defaultLeverage) || 10,
       };
 
-      const practice = createPractice(settings, seed, form.hidden);
+      const practice = createPractice(settings, seed, hidden);
       await savePractice(practice);
-      setInfo(
-        `已创建练习：${symbol} / ${TF_OPTIONS.find((t) => t.ms === form.tfMs)?.label} / 从第 ${startIndex} 根开始`
-      );
-      setTimeout(() => navigate(`/practice/${practice.sessionId}`), 600);
+      navigate(`/practice/${practice.sessionId}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (symbols.length === 0) {
+      setError('请先导入数据（Library 页导入数据包）');
+      return;
+    }
+    // Handle random symbol selection
+    let symbol = form.symbol;
+    if (symbol === 'random' || symbol === '') {
+      symbol = symbols[Math.floor(Math.random() * symbols.length)];
+    }
+    await startPractice(form.tfMs, symbol, form.startMode, form.hidden);
   }
 
   const marketOpenDisabled = ![5, 10, 15, 30].includes(form.tfMs / 60000);
@@ -135,7 +141,7 @@ export function SetupPage() {
       <form onSubmit={onSubmit}>
         <div className="card">
           <h2>基础设置</h2>
-          <div className="row" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: 14 }}>
+          <div className="row" style={{ alignItems: 'stretch', flexWrap: 'wrap', gap: 14 }}>
             <label className="field grow">
               K 线频率
               <select
@@ -153,6 +159,7 @@ export function SetupPage() {
               品种
               <select value={form.symbol} onChange={(e) => set('symbol', e.target.value)}>
                 <option value="">选择品种…</option>
+                <option value="random">🎲 随机</option>
                 {symbols.map((s) => (
                   <option key={s} value={s}>
                     {s}
@@ -162,7 +169,7 @@ export function SetupPage() {
             </label>
           </div>
 
-          <div className="row" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
+          <div className="row" style={{ alignItems: 'stretch', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
             <label className="field grow">
               起始时间模式
               <select
@@ -193,7 +200,7 @@ export function SetupPage() {
             </p>
           )}
 
-          <div className="row" style={{ alignItems: 'flex-start', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
+          <div className="row" style={{ alignItems: 'stretch', flexWrap: 'wrap', gap: 14, marginTop: 12 }}>
             <label className="field grow">
               初始资金（USDT）
               <input
@@ -227,34 +234,28 @@ export function SetupPage() {
           </div>
         </div>
 
-        <div className="card">
-          <h2>随机与隐藏</h2>
-          <div className="row">
-            <label className="row" style={{ gap: 6 }}>
-              <input
-                type="checkbox"
-                checked={form.hidden}
-                onChange={(e) => set('hidden', e.target.checked)}
-              />
-              隐藏品种与日期（练习结束才揭晓）
-            </label>
-          </div>
-          <div className="row" style={{ marginTop: 12 }}>
-            <button type="button" className="btn" onClick={pickRandom}>
-              全部随机
-            </button>
-            <span className="muted" style={{ fontSize: 12 }}>
-              随机频率 + 品种 + 起始，并自动开启隐藏
-            </span>
-          </div>
-        </div>
-
         {error && <p className="down">{error}</p>}
         {info && <p className="up">{info}</p>}
 
         <button type="submit" className="btn primary" disabled={busy} style={{ marginTop: 14, width: '100%' }}>
           {busy ? '创建中…' : '开始练习'}
         </button>
+
+        <div className="card" style={{ marginTop: 14 }}>
+          <h2>快速开始</h2>
+          <div style={{ textAlign: 'center' }}>
+            <button
+              type="button"
+              className="btn primary random-btn"
+              onClick={pickRandom}
+            >
+              🎲 全部随机
+            </button>
+            <p className="muted" style={{ fontSize: 12, margin: '8px 0 0' }}>
+              随机频率 + 品种 + 起始时间，并隐藏品种与日期
+            </p>
+          </div>
+        </div>
       </form>
     </div>
   );

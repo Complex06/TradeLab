@@ -27,6 +27,8 @@ export interface Position {
   liqPrice: number;
   realizedPnl: number; // cumulative realized PnL of this position (partial closes)
   openedIndex: number; // bar index at which the position was opened
+  feesPaid?: number; // total fees paid on this position (open + closes)
+  closedQty?: number; // accumulated quantity closed so far (partial closes)
 }
 
 export interface Order {
@@ -59,6 +61,13 @@ export interface ClosedTrade {
   pnl: number; // realized PnL incl. fees
   holdIndex: number; // bars held
   liq: boolean; // closed by liquidation
+  side: Side;
+  qty: number; // total quantity closed in this round trip
+  openPrice: number; // entry (average) price
+  closePrice: number; // exit price (last fill / liquidation price)
+  fee: number; // total fees paid across the round trip
+  openedAt: number; // bar index of open fill
+  closedAt: number; // bar index of final close
 }
 
 export interface TradeRecord {

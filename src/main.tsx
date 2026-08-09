@@ -11,6 +11,14 @@ if ('serviceWorker' in navigator) {
   });
 }
 
+// Ask the browser to persist IndexedDB storage (datasets/practice snapshots)
+// so data isn't evicted under storage pressure — important on iOS Safari.
+if (navigator.storage?.persist) {
+  void navigator.storage.persist().catch(() => {
+    // Best-effort: some browsers deny or prompt; the app still works.
+  });
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />

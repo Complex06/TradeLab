@@ -1,12 +1,54 @@
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useBootstrap, usePractices } from '../data/hooks';
-import { deleteDataset, deletePractice } from '../data/db';
+import { deleteDataset, deletePractice, getDataset } from '../data/db';
+import { downloadSymbolDataset } from '../data/download';
 import { tfLabel } from '../core/aggregate';
 import { fmtTime } from '../lib/format';
 
 export function LibraryPage() {
   const { state, datasets, refresh: refreshDatasets, retry } = useBootstrap();
   const { practices, refresh: refreshPractices } = usePractices();
+  const [dlSymbol, setDlSymbol] = useState('');
+  const [dlDays, setDlDays] = useState(365);
+  const [dlBusy, setDlBusy] = useState(false);
+  const [dlMsg, setDlMsg] = useState<string | null>(null);
+  const [dlErr, setDlErr] = useState<string | null>(null);
+
+  async function downloadSymbol() {
+    const sym = dlSymbol.trim().toUpperCase();
+    if (!sym) {
+      setDlErr('请输入品种代码');
+      return;
+    }
+    if (!/^[A-Z0-9]+$/.test(sym)) {
+      setDlErr('品种代码格式不正确，例如 BTCUSDT、XRPUSDT');
+      return;
+    }
+    setDlErr(null);
+    setDlMsg(null);
+    setDlBusy(true);
+    try {
+      const existing = await getDataset(sym);
+      if (existing) {
+        setDlErr(`品种 ${sym} 已存在，无需重复下载`);
+        return;
+      }
+      await downloadSymbolDataset(sym, {
+        days: dlDays,
+        onProgress: (p) => {
+          setDlMsg(`正在下载 ${p.message ?? sym} …`);
+        },
+      });
+      await refreshDatasets();
+      const rangeLabel = dlDays === 0 ? '全部历史' : `最近 ${dlDays} 天`;
+      setDlMsg(`品种 ${sym}（${rangeLabel}）下载完成，已加入练习库`);
+    } catch (err) {
+      setDlErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDlBusy(false);
+    }
+  }
 
   async function removeDataset(symbol: string) {
     await deleteDataset(symbol);
@@ -80,6 +122,36 @@ export function LibraryPage() {
 
       <div className="card">
         <h2>可用品种</h2>
+        <div className="row" style={{ marginBottom: 10 }}>
+          <input
+            type="text"
+            placeholder="输入品种代码，如 XRPUSDT"
+            value={dlSymbol}
+            onChange={(e) => setDlSymbol(e.target.value)}
+            className="grow"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void downloadSymbol();
+            }}
+          />
+          <select
+            value={dlDays}
+            onChange={(e) => setDlDays(Number(e.target.value))}
+            style={{ width: 112, flexShrink: 0 }}
+          >
+            <option value={31}>近 1 个月</option>
+            <option value={92}>近 3 个月</option>
+            <option value={183}>近 6 个月</option>
+            <option value={365}>近 1 年</option>
+            <option value={730}>近 2 年</option>
+            <option value={1095}>近 3 年</option>
+            <option value={0}>全部历史</option>
+          </select>
+          <button className="btn primary" onClick={() => void downloadSymbol()} disabled={dlBusy}>
+            {dlBusy ? '下载中…' : '下载品种'}
+          </button>
+        </div>
+        {dlErr && <p className="down" style={{ fontSize: 12, margin: '0 0 8px' }}>{dlErr}</p>}
+        {dlMsg && <p className="up" style={{ fontSize: 12, margin: '0 0 8px' }}>{dlMsg}</p>}
         {datasets.length === 0 ? (
           <div className="empty">
             {state.status === 'downloading' ? '正在准备数据…' : '暂无数据，请等待下载或重试。'}

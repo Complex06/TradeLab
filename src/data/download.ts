@@ -46,6 +46,68 @@ export async function downloadDefaultDatasets(options: DownloadOptions = {}): Pr
   return out;
 }
 
+export interface SymbolDownloadOptions {
+  days?: number; // lookback window in days (default 365); 0 = all history
+  onProgress?: (progress: DownloadProgress) => void;
+}
+
+/** Download and persist a single symbol (on-demand, from the Library page). */
+export async function downloadSymbolDataset(
+  symbol: string,
+  options: SymbolDownloadOptions = {}
+): Promise<Dataset> {
+  const days = options.days ?? 365;
+  let bars: Bar[];
+  if (days === 0) {
+    bars = await downloadSymbolAllHistory(symbol, (message) => {
+      options.onProgress?.({ done: 0, total: 1, message });
+    });
+  } else {
+    const months = monthKeysSince(Date.now() - days * DAY);
+    bars = await downloadSymbol(symbol, months, (message) => {
+      options.onProgress?.({ done: 0, total: 1, message });
+    });
+  }
+  const dataset: Dataset = { symbol, bars, importedAt: Date.now() };
+  await saveDataset(dataset);
+  options.onProgress?.({ done: 1, total: 1, message: `${symbol} 完成` });
+  return dataset;
+}
+
+/** Walk months backward from the current month until 3 consecutive months
+ *  have no archive file (i.e. before the symbol was listed). */
+export async function downloadSymbolAllHistory(
+  symbol: string,
+  onProgress?: (message: string) => void
+): Promise<Bar[]> {
+  const byTime = new Map<number, Bar>();
+  const now = new Date();
+  let year = now.getUTCFullYear();
+  let month = now.getUTCMonth() + 1;
+  let misses = 0;
+  while (misses < 3 && year >= 2017) {
+    const key = `${year}-${String(month).padStart(2, '0')}`;
+    onProgress?.(`${symbol} ${key}`);
+    const csv = await fetchMonthCsv(symbol, key);
+    if (csv === null) {
+      misses += 1;
+    } else {
+      misses = 0;
+      for (const bar of parseCsvBars(csv)) byTime.set(bar.t, bar);
+    }
+    month -= 1;
+    if (month === 0) {
+      month = 12;
+      year -= 1;
+    }
+  }
+  const bars = [...byTime.values()].sort((a, b) => a.t - b.t);
+  if (bars.length === 0) {
+    throw new Error(`${symbol} 没有可用数据，请检查品种代码是否正确`);
+  }
+  return bars;
+}
+
 /** Months like "2025-08" from `fromMs` through the current month, inclusive. */
 function monthKeysSince(fromMs: number): string[] {
   const out: string[] = [];

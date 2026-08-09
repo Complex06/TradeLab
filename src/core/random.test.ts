@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { nyseOpenMs, findMarketOpenIndex, randomTradingDay, makeRng, resolveStartIndex } from './random';
+import { aggregate5m } from './aggregate';
 
 describe('nyseOpenMs (DST aware)', () => {
   it('summer (EDT, UTC-4): Beijing 21:30', () => {
@@ -100,6 +101,29 @@ describe('resolveStartIndex (market-open)', () => {
       const minutes = new Date(bar.t).getUTCMinutes();
       expect([hours, minutes]).toEqual([13, 30]);
     }
+  });
+
+  it('resolves practice start against aggregated bars (aggregated index space)', () => {
+    const start = Date.UTC(2025, 7, 1);
+    const five = Array.from({ length: 105120 }, (_, i) => ({
+      t: start + i * 300000,
+      o: 1,
+      h: 1,
+      l: 1,
+      c: 1,
+      v: 1,
+    }));
+    const tfMs = 30 * 60 * 1000;
+    const agg = aggregate5m(five, tfMs);
+    // Custom index refers to the aggregated series directly.
+    const res = resolveStartIndex(agg, tfMs, 'custom', 100, makeRng(1), new Date(), 200);
+    expect(res.startIndex).toBe(100);
+    expect(agg[res.startIndex].t % tfMs).toBe(0);
+    // Market-open on the aggregated series lands on the bar containing 13:30 UTC.
+    const mo = resolveStartIndex(agg, tfMs, 'market-open', null, makeRng(4), new Date(2026, 7, 5, 21), 200);
+    const bar = agg[mo.startIndex];
+    expect(new Date(bar.t).getUTCHours()).toBe(13);
+    expect(new Date(bar.t).getUTCMinutes()).toBe(30);
   });
 });
 

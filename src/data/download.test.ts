@@ -7,7 +7,7 @@ vi.mock('./db', () => ({
   saveDataset: vi.fn(async () => {}),
 }));
 
-import { downloadDefaultDatasets } from './download';
+import { downloadDefaultDatasets, downloadSymbolDataset, downloadSymbolAllHistory } from './download';
 import { saveDataset } from './db';
 import type { Bar } from '../core/types';
 
@@ -154,6 +154,54 @@ describe('downloadDefaultDatasets', () => {
     expect(progress.length).toBeGreaterThanOrEqual(2);
     expect(progress[0]).toMatchObject({ done: 0, total: 1 });
     expect(progress[progress.length - 1]).toMatchObject({ done: 1, total: 1 });
+
+    vi.unstubAllGlobals();
+  });
+});
+
+describe('downloadSymbolDataset', () => {
+  it('downloads and persists a single symbol on demand', async () => {
+    const fetchMock = vi.fn(async (_url: string) => new Response(buildZip(CSV)));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const progress: Array<{ done: number; total: number }> = [];
+    const ds = await downloadSymbolDataset('XRPUSDT', { onProgress: (p) => progress.push(p) });
+
+    expect(ds.symbol).toBe('XRPUSDT');
+    expect(ds.bars).toHaveLength(2);
+    expect(saveDataset).toHaveBeenCalledWith(ds);
+    expect(progress[0]).toMatchObject({ done: 0, total: 1 });
+    expect(progress[progress.length - 1]).toMatchObject({ done: 1, total: 1 });
+
+    vi.unstubAllGlobals();
+  });
+});
+
+describe('downloadSymbolAllHistory', () => {
+  it('walks months back and stops after 3 consecutive months without data', async () => {
+    const now = new Date();
+    const key = (offset: number) => {
+      const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 1));
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+    };
+    // Current month 404, two data months, then 3 consecutive 404s → stop.
+    const hits = new Set([key(-1), key(-2)]);
+    const fetchMock = vi.fn(async (url: string) => {
+      const m = String(url).match(/(\d{4}-\d{2})\.zip$/);
+      const k = m ? m[1] : '';
+      return hits.has(k) ? new Response(buildZip(CSV)) : new Response('', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const seen: string[] = [];
+    const bars = await downloadSymbolAllHistory('HYPEUSDT', (msg) => seen.push(msg));
+
+    // Scanned: current (404) + 2 data months + 3 trailing 404s = 6 months.
+    expect(seen).toHaveLength(6);
+    expect(seen.some((s) => s.endsWith(key(-6)))).toBe(false);
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes(key(-6)))).toBe(false);
+    // The two data months hold the same CSV → dedupe to 2 unique bars.
+    expect(bars).toHaveLength(2);
 
     vi.unstubAllGlobals();
   });

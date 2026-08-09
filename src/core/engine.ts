@@ -12,6 +12,10 @@ import type {
 } from './types';
 import { liqPrice, feeRate, requiredMargin, round6 } from './calc';
 
+/** Snapshot format version. v2 stores bar indices in AGGREGATED-bar space
+ *  (created against the aggregated series); v1 used raw 5m indices. */
+export const PRACTICE_VERSION = 2;
+
 const clone = <T>(x: T): T => structuredClone(x);
 
 let seq = 0;
@@ -45,7 +49,7 @@ export function createPractice(
   hidden = false
 ): PracticeState {
   return {
-    version: 1,
+    version: PRACTICE_VERSION,
     sessionId: nextId('s_'),
     seed,
     settings,
@@ -209,6 +213,12 @@ function openFill(state: PracticeState, order: Order, price: number, index: numb
   if (!o || o.status !== 'active') return false;
   const pos = state.position;
   const side = o.action === 'openLong' ? 'long' : 'short';
+  // One-way (D14): an opposite-side open must never replace the position.
+  // The order may have been placed while flat and trigger later.
+  if (pos && pos.side !== side) {
+    o.status = 'ignored';
+    return false;
+  }
   const notional = o.qty * price;
   const margin = requiredMargin(notional, o.leverage);
   const fee = notional * feeRate(o.orderType);
@@ -228,6 +238,7 @@ function openFill(state: PracticeState, order: Order, price: number, index: numb
     pos.margin += margin;
     pos.leverage = o.leverage;
     pos.liqPrice = liqPrice(pos.avgPrice, side, pos.leverage);
+    pos.feesPaid = (pos.feesPaid ?? 0) + fee;
   } else {
     state.position = {
       side,
@@ -238,6 +249,8 @@ function openFill(state: PracticeState, order: Order, price: number, index: numb
       liqPrice: liqPrice(price, side, o.leverage),
       realizedPnl: 0,
       openedIndex: index,
+      feesPaid: fee,
+      closedQty: 0,
     };
   }
 
@@ -271,6 +284,8 @@ function closeFill(state: PracticeState, order: Order, price: number, index: num
 
   state.balance += pnlNet;
   pos.realizedPnl += pnlNet;
+  pos.feesPaid = (pos.feesPaid ?? 0) + fee;
+  pos.closedQty = (pos.closedQty ?? 0) + closeQty;
   pos.qty -= closeQty;
   // Release margin proportionally.
   pos.margin -= pos.margin * (closeQty / (pos.qty + closeQty));
@@ -284,7 +299,18 @@ function closeFill(state: PracticeState, order: Order, price: number, index: num
   recordFill(state, o, price, index, ts);
 
   if (pos.qty <= 0) {
-    state.closedTrades.push({ pnl: round6(pos.realizedPnl), holdIndex: index - pos.openedIndex, liq: false });
+    state.closedTrades.push({
+      pnl: round6(pos.realizedPnl),
+      holdIndex: index - pos.openedIndex,
+      liq: false,
+      side: pos.side,
+      qty: pos.closedQty ?? closeQty,
+      openPrice: pos.avgPrice,
+      closePrice: price,
+      fee: pos.feesPaid ?? 0,
+      openedAt: pos.openedIndex,
+      closedAt: index,
+    });
     state.position = null;
   }
   return true;
@@ -316,20 +342,21 @@ function liquidate(state: PracticeState, pos: Position, index: number, ts: numbe
     parentOrderId: liqOrder.id,
     liq: true,
   });
-  state.closedTrades.push({ pnl: -pos.margin, holdIndex: index - pos.openedIndex, liq: true });
+  state.closedTrades.push({
+    // Net of the whole round trip: prior partial-close realized PnL minus the
+    // liquidation loss (the recorded pnl must match the actual balance change).
+    pnl: round6(pos.realizedPnl - pos.margin),
+    holdIndex: index - pos.openedIndex,
+    liq: true,
+    side: pos.side,
+    qty: round6((pos.closedQty ?? 0) + pos.qty),
+    openPrice: pos.avgPrice,
+    closePrice: pos.liqPrice,
+    fee: pos.feesPaid ?? 0,
+    openedAt: pos.openedIndex,
+    closedAt: index,
+  });
   state.position = null;
-}
-
-/** Priority of an event (stop) order per D05: liq > stop-loss > take-profit > open. */
-function stopPriority(o: Order, pos: Position | null): number {
-  if (o.action === 'closeLong' || o.action === 'closeShort') {
-    // A close order is not a real event without a position (D16: ignored).
-    if (!pos) return 0;
-    // stop-loss: for long, price <= avg; for short, price >= avg (worst case first)
-    const isSL = o.action === 'closeLong' ? o.price! <= pos.avgPrice : o.price! >= pos.avgPrice;
-    return isSL ? 3 : 2;
-  }
-  return 1; // open
 }
 
 // ---------------------------------------------------------------------------
@@ -346,22 +373,100 @@ export function advance(state: PracticeState, bar: Bar, index: number, isLastBar
     else openFill(s, o, bar.o, index, bar.t);
   }
 
-  // --- Stage 2: event (stop) orders — at most ONE fires ---
+  // --- Stage 2: event (stop) orders (D05/D06) ---
+  // Settlement follows the price path ("first to trigger settles"):
+  // 1) gap through the liq price at the open → liquidation wins;
+  // 2) same-side stop-losses settle IN ORDER (no cancelling of later ones);
+  // 3) intra-bar liq touch for the remainder → liquidation;
+  // 4) same-side take-profits settle in order; cross-side (TP+SL) → SL side.
   const pos = s.position;
-  let liqHit = false;
+  let eventDone = false;
+  let closedByEvent = false;
   if (pos) {
-    liqHit = pos.side === 'long' ? bar.l <= pos.liqPrice : bar.h >= pos.liqPrice;
-    if (liqHit) {
+    // Gap-through liquidation: the position is insolvent at the open, so no
+    // stop order can save it.
+    if (pos.side === 'long' ? bar.o <= pos.liqPrice : bar.o >= pos.liqPrice) {
       liquidate(s, pos, index, bar.t);
       // Liquidation cancels ALL event orders (D06).
       for (const o of s.orders) if (o.status === 'active' && o.orderType === 'stop') o.status = 'cancelled';
+      eventDone = true;
+      closedByEvent = true;
     }
   }
-  // Event scan runs with or without a position: open stop orders must be able
-  // to trigger (buy stop needs high ≥ price; sell stop needs low ≤ price).
-  if (!liqHit) {
+
+  // Same-side close stops settle in crossing order (D05): loss side first
+  // (protective SLs), then a liq check, then profit side (TPs). Cross-side
+  // (TP + SL both triggered) → the stop-loss side wins, TP side is cancelled.
+  if (!eventDone && pos) {
+    const long = pos.side === 'long';
+    const isSL = (o: Order) =>
+      o.action === 'closeLong' ? o.price! <= pos.avgPrice : o.price! >= pos.avgPrice;
+    const triggered = s.orders.filter(
+      (o) =>
+        o.status === 'active' &&
+        o.orderType === 'stop' &&
+        o.reduceOnly &&
+        (o.action === 'closeLong' ? bar.l <= o.price! : bar.h >= o.price!)
+    );
+    // Protective stop-losses only: their price sits between entry and liq, so
+    // the price crosses them before the liquidation level (D06).
+    const lossSide = triggered
+      .filter((o) => isSL(o) && (long ? o.price! > pos.liqPrice : o.price! < pos.liqPrice))
+      .sort((a, b) => (long ? b.price! - a.price! : a.price! - b.price!));
+    const profitSide = triggered
+      .filter((o) => !isSL(o))
+      .sort((a, b) => (long ? a.price! - b.price! : b.price! - a.price!));
+
+    const hadCloses = lossSide.length > 0 || profitSide.length > 0;
+    // 1) Loss side (protective SLs) settles first, in crossing order.
+    for (const o of lossSide) {
+      // Once the position is fully closed, stop filling; the remaining
+      // same-side orders are cancelled below (they must not linger).
+      if (!s.position) break;
+      const sellSide = o.action === 'openShort' || o.action === 'closeLong';
+      const gapFill = sellSide ? bar.o <= o.price! : bar.o >= o.price!;
+      const fillPrice = gapFill ? bar.o : o.price!; // D10
+      closeFill(s, o, fillPrice, index, bar.t);
+    }
+    // 2) Liq touch for the remainder — checked BEFORE the profit side, because
+    // a same-bar TP + liq crossing is path-ambiguous → liq priority (D05).
+    const pNow = s.position;
+    if (pNow && (pNow.side === 'long' ? bar.l <= pNow.liqPrice : bar.h >= pNow.liqPrice)) {
+      liquidate(s, pNow, index, bar.t);
+      for (const o of s.orders) if (o.status === 'active' && o.orderType === 'stop') o.status = 'cancelled';
+      eventDone = true;
+      closedByEvent = true;
+    }
+    // 3) Profit side (TPs) settles the REMAINING position if it survived the
+    // liq check — a partial stop-loss does not cancel the take-profit (N8).
+    if (!eventDone && s.position) {
+      for (const o of profitSide) {
+        if (!s.position) break;
+        const sellSide = o.action === 'openShort' || o.action === 'closeLong';
+        const gapFill = sellSide ? bar.o <= o.price! : bar.o >= o.price!;
+        const fillPrice = gapFill ? bar.o : o.price!; // D10
+        closeFill(s, o, fillPrice, index, bar.t);
+      }
+    }
+    if (hadCloses) {
+      eventDone = true;
+      if (!s.position) closedByEvent = true;
+    }
+  }
+
+  // Once an event (liq / SL / TP) fully closed the position, remaining
+  // reduce-only TP/SL orders are cancelled — they must not linger or risk
+  // reversing the position later.
+  if (closedByEvent && !s.position) {
+    for (const o of s.orders) {
+      if (o.status === 'active' && o.reduceOnly) o.status = 'cancelled';
+    }
+  }
+
+  // Open-order events (breakout entries): at most one, earliest-created wins;
+  // other active stop orders are cancelled after it fires (D05).
+  if (!eventDone) {
     let best: Order | null = null;
-    let bestPrio = -1;
     for (const o of s.orders) {
       if (o.status !== 'active' || o.orderType !== 'stop') continue;
       // Reduce-only close orders without a position are ignored, not events.
@@ -369,20 +474,8 @@ export function advance(state: PracticeState, bar: Bar, index: number, isLastBar
       const sellSide = o.action === 'openShort' || o.action === 'closeLong';
       const triggered = sellSide ? bar.l <= o.price! : bar.h >= o.price!;
       if (!triggered) continue;
-      const prio = stopPriority(o, s.position);
-      let isBetter: boolean;
-      if (best === null) {
-        isBetter = true;
-      } else if (prio !== bestPrio) {
-        isBetter = prio > bestPrio;
-      } else {
-        // Same priority layer → earliest created wins (deterministic tie-break).
-        isBetter = o.createdAtIndex < best.createdAtIndex ||
-          (o.createdAtIndex === best.createdAtIndex && o.id < best.id);
-      }
-      if (isBetter) {
+      if (!best || o.createdAtIndex < best.createdAtIndex || (o.createdAtIndex === best.createdAtIndex && o.id < best.id)) {
         best = o;
-        bestPrio = prio;
       }
     }
     if (best) {
