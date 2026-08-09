@@ -11,6 +11,7 @@ import {
   deletePractice,
   getSetting,
   setSetting,
+  closeDbForTest,
 } from './db';
 import { createPractice } from '../core/engine';
 import type { Dataset, PracticeSettings } from '../core/types';
@@ -66,5 +67,15 @@ describe('IndexedDB data layer', () => {
     expect(await getSetting<boolean>('bootstrapDone')).toBe(true);
     await setSetting('bootstrapDone', false);
     expect(await getSetting<boolean>('bootstrapDone')).toBe(false);
+  });
+
+  it('recovers when the IndexedDB connection is closed (iOS backgrounding)', async () => {
+    const a: Dataset = { symbol: 'TESTBG1', bars: five(2), importedAt: 1 };
+    await saveDataset(a);
+    closeDbForTest(); // simulate iOS closing the connection while backgrounded
+    const b: Dataset = { symbol: 'TESTBG2', bars: five(2), importedAt: 2 };
+    await saveDataset(b); // must transparently retry on a fresh connection
+    expect(await getDataset('TESTBG2')).toEqual(b);
+    expect(await getDataset('TESTBG1')).toEqual(a);
   });
 });
